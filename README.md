@@ -1,7 +1,7 @@
 # PRISM - Pulmonary Response and Inhaler System Monitor
 
-> Acoustic smart inhaler monitoring — real-time inhalation quality analysis using
-> on-device ML inference. No cloud audio processing. No continuous streaming.
+> Acoustic smart inhaler monitoring — inhalation-event detection and baseline-consistency
+> analysis using on-device ML inference. No cloud audio processing. No continuous streaming.
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.x-red.svg)](https://pytorch.org/)
@@ -14,21 +14,26 @@
 PRISM is an end-to-end smart inhaler platform for pressurised Metered-Dose Inhalers
 (pMDI). It records inhalation audio from a custom ESP32-based hardware attachment,
 transmits it via Bluetooth Low Energy to a smartphone, and performs on-device ML
-inference to classify every 8 ms audio frame into one of four event classes:
+inference. The detector classifies overlapping 200 ms audio windows, one every
+16 ms, into four acoustic event classes:
 
 | Class | Description |
 |---|---|
-| **Drug** | Aerosol spray actuation (~300 ms broadband noise burst) |
+| **Drug** | Aerosol spray actuation (annotated median 0.47 s) |
 | **Inhale** | Sustained inward airflow through the inhaler |
-| **Exhale** | Patient exhaling prior to inhalation |
+| **Exhale** | Exhalation |
 | **Noise** | Ambient background, silence, handling sounds |
 
-The resulting event sequence enables per-session assessment of:
-- Medication delivery (Drug class detected?)
-- Inhalation duration and depth
-- Actuator-to-inhalation coordination delay
-- Pre-inhalation exhale technique
-- Longitudinal deviation from personal baseline
+Current state (details in `ARCHITECTURE.md` §1 and §9):
+- **Implemented:** inhalation events (times, durations) and whether each one is measurable ("scoreable").
+- **Implemented; calibration checked held-out by recording session on the same PRISM corpus:** a final reference-range assessment of each scoreable inhalation (Stage 9).
+  - **What it gives:** the event's acoustic deviation from a global reference, and its empirical reference-tail probability among the reference deviations.
+  - **The statement:** `WITHIN_REFERENCE_RANGE` or `OUTSIDE_REFERENCE_RANGE` (deviation above the one-sided 95% upper reference limit), with a `STABLE` / `BORDERLINE` label.
+  - **What it is not:** external validation, or a normal/abnormal, anomaly, technique or clinical classification.
+- **Experimental:** the underlying V2 representation (`DRAFT_NOT_FROZEN`).
+- **Planned:** a personal baseline. It needs longitudinal user/device data.
+- **Not validated:** Drug/Exhale event analytics, such as actuation or coordination timing.
+- **Not supported:** technique-quality or clinical labels. The dataset has acoustic event annotations only.
 
 ---
 
@@ -76,6 +81,332 @@ python src/run_pipeline.py --xgb-only
 python src/run_pipeline.py --no-svm
 ```
 
+### Inspect Detected Inhalations
+
+The post-event layer reuses the exported CNN; it does not retrain or make
+technique-quality judgments.  It groups its overlapping window predictions
+into inhalation candidates and measures the matching original-waveform region.
+
+```bash
+python src/post_event.py data/your_recording.wav --plot results/your_recording_diagnostic.png
+```
+
+From a notebook or experiment script run from the project root:
+
+```python
+import sys
+sys.path.append("src")
+
+from post_event import detect_events, analyze_inhalation, plot_diagnostic
+
+events, predictions = detect_events("data/your_recording.wav", return_predictions=True)
+analysis = analyze_inhalation("data/your_recording.wav", events[0])
+figure, axes = plot_diagnostic("data/your_recording.wav", predictions, events)
+```
+
+`TemporalGroupingConfig` exposes optional label smoothing, gap allowance,
+minimum duration, and confidence controls.  Defaults apply no extra filtering;
+they are temporal-cleanup controls, not validated clinical thresholds.
+
+### Explore All Detected Inhalations
+
+Create an event-level CSV and distribution plots across every recording:
+
+```bash
+python src/explore_inhalations.py
+```
+
+This writes `results/post_event/inhalation_events.csv`, a run manifest, and
+histograms plus duration-versus-RMS/energy scatter plots. To persist each
+original-waveform event segment as a WAV file too, add `--export-segments`.
+
+### Finalize the Inhale-Event Dataset (Stage 1)
+
+```bash
+python src/inhale_dataset.py
+```
+
+This reads `results/post_event/inhalation_events.csv` without modifying it. It
+writes the following to `results/inhale_dataset/`:
+
+- `inhale_events_v1.csv`: every event, plus usability flags, `exclusion_reasons`
+  and a chronological `usable_order`
+- an audit against `data/annotation.csv`, used only to check the rule
+- a rule-sensitivity table
+- `dataset_summary.json`
+
+"Usable" means eligible for baseline modeling. It is not a technique-quality
+label. See `PRISM_RESEARCH_LOG.md` Entry 3 for the rule and its evidence.
+
+### Feature Analysis and V1 Feature Selection (Stage 2)
+
+```bash
+python src/feature_analysis.py
+```
+
+This reads the Stage 1 table and re-reads the original WAVs for the RMS-envelope
+edge check. It writes the following to `results/feature_analysis/`:
+
+- distribution and robust-scale summaries for the 13 candidate features
+- Spearman redundancy, overall and within sessions
+- date and session stability
+- calibration-set representativeness
+- edge-effect tables and figures
+- `feature_selection_v1.json`: the KEEP / EXCLUDE / DEFER decision that later
+  stages read
+
+See `PRISM_RESEARCH_LOG.md` Entry 4.
+
+### V1 Robust Baseline (Stage 3)
+
+```bash
+python src/baseline_v1.py
+```
+
+This fits a per-feature median / MAD baseline on the first 20 usable events.
+The features come from `feature_selection_v1.json`. It writes the following to
+`results/baseline_v1/`:
+
+- the baseline itself (`baseline_v1.json`, loadable with `baseline_v1.load_baseline`)
+- a per-feature robust z-score for every usable event
+- group and session summaries of those z-scores
+- calibration-sensitivity analyses (random and session-aware calibration sets)
+
+No anomaly score, threshold or NORMAL/ANOMALY label is produced yet. See
+`PRISM_RESEARCH_LOG.md` Entry 5.
+
+### V1 Candidate Combined Scores (Stage 4)
+
+```bash
+python src/scoring_v1.py
+```
+
+This combines the seven Stage 3 robust z-scores of every usable event into
+three candidate scores: `mean_abs_z`, `rms_z` and `max_abs_z`. It also scores
+the 20 calibration events leave-one-out. It writes the following to
+`results/scoring_v1/`:
+
+- per-event scores and feature contributions
+- group, session and feature-dominance summaries
+
+No threshold is applied and no event is labelled NORMAL or ANOMALY. See
+`PRISM_RESEARCH_LOG.md` Entry 6.
+
+### Baseline Strategy Experiment (Stage 5)
+
+```bash
+python src/baseline_strategies.py
+```
+
+This compares baselines on sessions that were not used to fit them, keeping the
+same 7 features, robust z-scores and candidate scores. The strategies are:
+
+- the first-20 control
+- a pooled in-sample baseline (descriptive only)
+- a leave-one-session-out global baseline
+- offline and warm-up session-location normalization
+- offline session location-and-scale normalization (a diagnostic)
+
+It writes held-out scores, per-strategy and per-feature stability, session
+medians, fold parameters and session-scale diagnostics to
+`results/baseline_strategies/`. No threshold is applied. See
+`PRISM_RESEARCH_LOG.md` Entry 7.
+
+### Natural Population Separation (Stage 6)
+
+```bash
+python src/natural_population_analysis.py
+```
+
+This scores every detected event with the frozen leave-one-session-out global
+baseline. The baseline for each session is fitted on the usable events of the
+other sessions only. The script then compares usable events with the
+Stage 1-excluded events (too short, close neighbour, recording boundary), both
+pooled and within sessions, with feature attribution. It also:
+
+- describes recordings without a detected inhalation using the existing
+  detector's window outputs
+- runs a controlled waveform-perturbation experiment (gain, noise, spectral
+  tilt)
+
+Outputs go to `results/natural_population/`. Excluded events are not treated as
+anomalies, and no threshold is applied. See `PRISM_RESEARCH_LOG.md` Entry 8.
+
+### Representation Robustness and Ablation (Stage 7)
+
+```bash
+python src/representation_analysis.py
+```
+
+This compares nine pre-specified feature representations under the frozen
+leave-one-session-out baseline. The comparisons are:
+
+- duration ablation
+- `spectral_flatness_std` removal or energy-weighted replacement
+- removing absolute level, or replacing it with recording-relative level
+- energy-weighted spectral statistics
+
+For each representation it reports session dependence, controlled-perturbation
+response (including whole-recording gain) and a diagnostic excluded-vs-usable
+comparison. A robust multivariate distance is compared only if a pre-specified
+stability gate passes; the gate failed for every representation.
+
+Outputs go to `results/representation_analysis/`, and the decision is in
+`recommendation.json`. No threshold is applied. See `PRISM_RESEARCH_LOG.md`
+Entry 9.
+
+### V2 Validation and Inference Contract (Stage 8)
+
+```bash
+# Reference run, then the recorded run (the second run checks byte-identity against the first, gate G6a)
+venv/Scripts/python.exe src/v2_validation.py --output-dir <scratch dir>
+venv/Scripts/python.exe src/v2_validation.py --reference-run <scratch dir>
+
+# Apply the inference contract to one recording (SCORE_ONLY JSON output)
+venv/Scripts/python.exe src/prism_inference.py data/<recording>.wav
+
+# Same, plus every intermediate stage (frame features, ONNX logits, diagnostic plot) for app parity checks
+venv/Scripts/python.exe results/recording_runs/run_recording.py data/<recording>.wav --input-domain reference_dataset
+```
+
+This stage validates the 4-feature V2 representation against an acceptance
+gate that was pre-registered before any result
+(`results/v2_validation/acceptance_gate_preregistration.json`, commit
+`55baeba`). The V2 features are `spectral_centroid_mean`,
+`spectral_flatness_mean`, `spectral_centroid_std` and `spectral_rolloff_std`.
+It also writes the machine-readable inference contract for the next
+(hardware / React Native) stage:
+
+| File | Content |
+|---|---|
+| `inference_contract_v2.json` | Full contract: input, detector, grouping, scoreability, features, baseline, scoring, output, limitations, and a status set by the gate |
+| `v2_baseline.json` | Global baseline parameters (median / 1.4826·MAD of the 318 usable events); loaded, never fitted, at inference |
+| `v2_feature_schema.json` | V2 feature order and extraction parameters |
+| `inference_output.schema.json` | JSON Schema of the per-recording output |
+| `golden/` | Conformance vectors (expected outputs) for re-implementations |
+| `acceptance_gate_results.json` | Verdict for every pre-registered criterion |
+
+**Stage 8 result.** V2 failed the pre-registered gate on one criterion
+(G4c): at a strong spectral tilt, `spectral_flatness_mean` and
+`spectral_centroid_std` change direction inconsistently across sessions. All
+other criteria passed, including exact end-to-end reproduction of the Stage 1
+events and features from raw audio. The contract is therefore issued as
+`DRAFT_NOT_FROZEN`: the interface can be implemented, but the representation
+is not frozen, and freezing it anyway is the project owner's decision.
+
+The output is `SCORE_ONLY`. `anomaly_score` is a distance from the
+baseline; it has no threshold and no NORMAL/ANOMALY label. A recording
+without a detected inhalation is reported as `NO_INHALATION_DETECTED`, never
+as an anomalous event. The baseline was fitted on the reference dataset and
+has not been validated for PRISM hardware. See `PRISM_RESEARCH_LOG.md`
+Entry 10.
+
+### Final Event-Level Assessment (Stage 9) — the canonical pipeline
+
+```bash
+# Assess one recording: raw 8 kHz WAV -> events -> V2 deviation -> reference-calibrated assessment (JSON)
+venv/Scripts/python.exe src/prism_assessment.py data/<recording>.wav --input-domain reference_dataset
+
+# Reproduce Stage 9: reference run, then the recorded run (byte-identity check K4)
+venv/Scripts/python.exe src/assessment_validation.py --output-dir <empty scratch dir>
+venv/Scripts/python.exe src/assessment_validation.py --reference-run <scratch dir>
+```
+
+Both output directories must be empty before the run, apart from
+`stage9_preregistration.json` in `results/final_assessment/`.
+- **Why:** the K4 check compares every CSV/JSON present in the output directory (Entries 13–14).
+- **What happens otherwise:** the script refuses to run with a `StageError` naming the leftover files. Remove the earlier outputs, or choose another `--output-dir`.
+
+Stage 9 adds the final stage of the pipeline on top of the unchanged V2
+inference contract. It does not change the detector, events, scoreability,
+features or baseline.
+
+**What each event gets.**
+- **Empirical reference-tail probability:** p = (1 + #{i : cᵢ ≥ a}) / (n + 1).
+  - a is the event's V2 aggregate acoustic deviation;
+  - cᵢ are the n = 318 reference deviations, each reference inhalation scored by a baseline fitted without its own recording session.
+
+  It is an empirical upper-tail probability with the +1 correction. It is not a hypothesis-test p-value, and no finite-sample guarantee is claimed.
+- **Reference-range assessment:**
+  - `WITHIN_REFERENCE_RANGE` if p > 0.05;
+  - `OUTSIDE_REFERENCE_RANGE` if p ≤ 0.05, equivalently a > c\*. The one-sided 95% upper reference limit c\* = 1.830 is the 304th smallest of the 318 reference deviations; the effective level is 15/319 ≈ 0.047;
+  - `NOT_ASSESSED` if the event is not scoreable, with its reasons.
+- **Stability label:**
+  - `STABLE`: the category is unchanged when the 18 reference sessions are resampled (2,000 draws, 5th–95th percentile band of the cut) and under every allowed ±1 detector-window boundary shift (16 ms);
+  - `BORDERLINE`: it changes under at least one of them.
+
+  It is not a probability that the category is correct.
+
+**Pre-registered gate.** The gate (`results/final_assessment/stage9_preregistration.json`) passed. It was evaluated held-out by recording session on the same PRISM corpus, which is an internal consistency/calibration check, not external validation. The contract status is `CATEGORICAL_ASSESSMENT_ADOPTED`.
+- **K1, held-out exceedance:** 5.35% [0.78%, 8.97%].
+- **K2, cut stability:** relative half-width 0.096.
+- **K3, controlled perturbations:** monotone under noise and spectral tilt, unchanged under gain.
+- **K4, reproducibility:** byte-identical reruns.
+
+**Robustness checks.**
+- **Alternatives:** none qualified, so V2 is retained. A correlation-aware distance and a G4c-repair subset were both compared.
+- **End-to-end:** all 361 recordings processed with 0 failures, and the output agrees exactly with the table-based evaluation.
+
+**Limits.**
+- **Session concentration:** calibration holds marginally, not per session. 14 of the 17 held-out OUTSIDE events come from two recording sessions, and 15 of 17 come from 2018-05-03 when whole days are held out. 8 of the 17 are `BORDERLINE`.
+- **Same corpus only:** every earlier design decision used the same 318 events. There is no external dataset, and the assessment is not validated for new users, devices, microphones or PRISM hardware.
+- **Global reference:** the reference is not personal (the data contain no user or device identifiers).
+- **Acoustic reference only:** OUTSIDE describes acoustic deviation relative to the PRISM reference corpus. It is not a normal/abnormal, anomaly, technique-quality or clinical classification.
+
+See `PRISM_RESEARCH_LOG.md` Entries 12–13.
+
+| File (`results/final_assessment/`) | Content |
+|---|---|
+| `assessment_contract_v1.json` | Canonical pipeline contract `prism-assessment-v1.0` |
+| `assessment_reference_v1.json` | Frozen reference: V2 baseline, 318 calibration scores, cut 1.830, band [1.620, 1.972] |
+| `assessment_output.schema.json` | JSON Schema of the per-recording output |
+| `golden/` | Conformance vectors for re-implementations |
+| `heldout_assessment.csv`, `calibration_by_session.csv` | Leave-one-session-out evaluation |
+| `e2e_loso_*.csv`, `e2e_deployment_*.csv` | End-to-end runs of the canonical pipeline over all recordings |
+| `representation_gate.csv`, `category_gate_results.json` | Representation comparison and category gate |
+
+### Personal Reference V3 (Stage 10) — separate channel, NOT validated
+
+```bash
+# Population (Stage 9, unchanged) + personal (V3) channel for one recording; state kept per user AND device
+venv/Scripts/python.exe src/personal_reference.py data/<recording>.wav --user <id> --device <id> \
+    --recorded-at 2026-01-05T08:00:00 --state-dir <state dir> --input-domain reference_dataset
+
+# Reproduce the Stage 10 PROXY/SYNTHETIC evaluation (empty output directory; README.md may be present)
+venv/Scripts/python.exe src/personal_reference_evaluation.py --output-dir <empty dir>
+```
+
+Stage 10 adds a **second, independent channel** next to Stage 9 (contract
+`prism-personal-reference-v3.0-draft`). Stage 9 is not modified, and its output is
+passed through byte for byte.
+
+**How the personal channel works.**
+- **Personal baseline:** B, a 4-vector in the frozen Stage 9 population-reference coordinates (z = (x − m0)/s0), kept per user and per device.
+  - It starts at the population median (B = 0).
+  - The scale and `mean_rms` are never adapted.
+- **Personal deviation:** sqrt(mean_j (z_j − B_j)²), computed against B from **before** the event's sitting. It is reported as a continuous value: no personal cut-off has been calibrated.
+- **When B moves:** only at sitting level, after the whole sitting has been assessed.
+  - A sitting has ≥ 10 scoreable events and counts as one unit of evidence (its per-feature median).
+  - The update is gated by a directional consensus: 9 of the last 10 qualifying sittings must lie on the same side (8 of 10 as a sensitivity configuration).
+  - The step is bounded: w = g·min(1, c·SE/|x − B|), with eta = 0.3 and c = 2.
+  - B is capped by a trust region, rms(B) ≤ 0.9; only an explicit re-enrollment can go beyond it.
+  - A gap of more than 14 days between qualifying sittings clears the consensus window.
+- **Bounds:**
+  - One sitting moves B by at most rms 0.238.
+  - One sitting alone can never open the gate.
+- **Warm-up:** `WARMUP` (population channel only) until 10 qualifying sittings exist.
+- **Audit:** every decision is written to a hash-chained audit log that replays bit for bit.
+
+**PROXY/SYNTHETIC evaluation only** (not personalization validation; `results/personal_reference/README.md`).
+- **Bounded influence:** isolated extreme events and single unusual sittings have bounded, mostly zero influence.
+- **Sustained shifts:** consistent shifts are adopted up to the trust region (+1.0: a median 0.835 of the shift after 50 sittings, of a reachable 0.90).
+- **Sustained noise or spectral tilt is absorbed as well:** the mechanism cannot tell behaviour from recording conditions.
+- **Real corpus:** a replay of the real corpus as one pseudo-user never leaves `WARMUP`, because only 8 of 23 sittings have ≥ 10 events.
+- **Not deployment-ready:** the sitting definition (≥ 10 scoreable events per sitting) comes from the corpus's recording sessions. Real inhaler use gives one or two inhalations per dose, so it must be redefined before any deployment; that has not been evaluated.
+
+The personal baseline is not a healthy, normal or correct-technique baseline, and V3
+does not identify correct or incorrect technique. See `PRISM_RESEARCH_LOG.md` Entry 15.
+
 ### Output
 
 ```
@@ -105,9 +436,15 @@ results/
 
 **XGBoost, 5-fold GroupKFold:** 89.0% ± 0.4%
 
-The Drug class achieves the highest F1 (~0.95) due to its spectrally distinctive
-broadband aerosol spray signature. Spectral Flatness is the single most discriminative
-feature (aerosol flatness ~0.7-1.0 vs breath sounds ~0.1-0.4).
+These are window-level metrics on held-out folds. The deployed ONNX model is the
+best of the 3 CNN folds (fold 1), trained on about two-thirds of the recordings;
+which recordings were in its training fold was not saved. Event agreement on the
+reference dataset is therefore mostly in-sample (`PRISM_RESEARCH_LOG.md` Entry 3).
+
+The Drug class has the highest F1 (~0.95). The saved XGBoost feature-importance
+figure ranks MFCC-derived features highest. Earlier claims that spectral flatness
+is the most discriminative feature are not supported by the saved artefacts
+(`ARCHITECTURE.md` §8.9).
 
 ---
 
@@ -139,8 +476,14 @@ PRISM smart inhaler/
     ├── train_cnn.py        # 1D CNN cross-validation + ONNX export
     ├── evaluate.py         # Metrics aggregation and analysis
     ├── visualize.py        # Confusion matrix and feature importance plots
-    └── run_pipeline.py     # Main entry point (orchestrates everything)
+    ├── run_pipeline.py     # Detector training entry point
+    ├── post_event.py       # ONNX wrapper, Inhale event grouping and measurement
+    ├── inhale_dataset.py … v2_validation.py  # Research Stages 1-8 (baseline, deviation, V2)
+    ├── prism_inference.py  # Inference contract V2 reference implementation
+    └── personal_reference*.py  # Stage 10 V3 personal channel + proxy evaluation (not validated)
 ```
+
+The full layout is in `ARCHITECTURE.md` §12, and the module reference is in §14.
 
 ---
 
@@ -164,7 +507,7 @@ The end-to-end pipeline has three distinct phases:
 Audio → librosa features (124-dim, 8 ms frames) → Sliding window (25 frames = 200 ms) → 1D CNN / XGBoost → ONNX export
 
 ### Phase 2 — Mobile Application
-BLE audio → Native C++ DSP (identical feature parameters) → ONNX Runtime inference → Session analytics → Firebase sync
+BLE audio → Native C++ DSP (identical feature parameters) → ONNX Runtime inference → inference contract V2 (events, scoreability, score) → Firebase sync
 
 ### Phase 3 — Hardware
 INMP441 I2S microphone → ESP32 DMA → RMS energy detector → BLE binary packet transmission
@@ -180,12 +523,12 @@ INMP441 I2S microphone → ESP32 DMA → RMS energy detector → BLE binary pack
 | Feature | Dim | Description |
 |---|---|---|
 | MFCC | 40 | Mel-frequency cepstral coefficients (n_mels=128, fmin=50 Hz, fmax=4000 Hz) |
-| Delta-MFCC | 40 | HTK regression filter (width=9, half-width N=4) |
-| Delta²-MFCC | 40 | Second-order HTK regression |
+| Delta-MFCC | 40 | Savitzky–Golay derivative (librosa `delta`, width=9, edges `interp`) |
+| Delta²-MFCC | 40 | Second-order Savitzky–Golay derivative of the MFCCs (not delta of delta) |
 | Spectral Centroid | 1 | Weighted mean frequency / Nyquist → [0,1] |
-| Spectral Flatness | 1 | Geometric/arithmetic mean ratio → [0,1] |
+| Spectral Flatness | 1 | Geometric/arithmetic mean ratio of the power spectrum → [0,1] |
 | Spectral Rolloff | 1 | 85th percentile frequency / Nyquist → [0,1] |
-| ZCR | 1 | Zero crossing rate per frame |
+| ZCR | 1 | Zero crossing rate over 2048-sample frames (hop 64) |
 | **Total** | **124** | Per-frame float32 vector |
 
 Signal processing parameters (must match in mobile app):
@@ -197,9 +540,12 @@ N_MELS       = 128
 FMIN         = 50.0   # Hz
 FMAX         = 4000.0 # Hz (Nyquist)
 N_MFCC       = 40
-DELTA_WIDTH  = 9      # HTK regression filter
+DELTA_WIDTH  = 9      # Savitzky–Golay width
 ROLLOFF_PERC = 0.85
 ```
+
+There is no pre-emphasis. MFCCs are floored at 80 dB below the loudest value in
+the whole input buffer. The complete parity table is in `ARCHITECTURE.md` §6.
 
 Features are cached as `.npy` files in `data/extracted/<base>/features.npy`.
 Delete the cache directory to force re-extraction.
@@ -230,7 +576,8 @@ Drug oversampled to `min(3.0 x count(Inhale), count(Exhale))` using Gaussian jit
 
 ### Cross-Validation
 
-`GroupKFold(k=5)` with groups = recording index (0..360).
+`GroupKFold` with groups = recording index (0..360): k=5 for the classical
+models, k=3 for the CNN (`results/cv_results.csv`).
 All frames from one recording are always in the same fold — no data leakage.
 
 ### 1D CNN Architecture (InhalerCNN)
@@ -291,20 +638,24 @@ inference. Export `scaler_mean.npy` and `scaler_scale.npy` from `train.py` line 
 
 ### DSP Implementation Requirements
 
-The mobile C++ DSP module must replicate `librosa_extractor.py` **exactly** using
-the parameter table above. Feature distribution mismatch is the most common cause
-of accuracy degradation in deployment. Validate by:
+The mobile C++ DSP module must replicate `librosa_extractor.py` **exactly**,
+following the parity table in `ARCHITECTURE.md` §6. The input is 8 kHz only,
+with no resampling and no preprocessing. Feature distribution mismatch is the
+most common cause of accuracy degradation in deployment. Validate by:
 
-1. Running `python src/librosa_extractor.py` on a test WAV to get reference features
-2. Running the mobile DSP on the same audio
-3. Checking mean absolute error < 0.001 across all 124 feature dimensions
+1. Running `results/recording_runs/run_recording.py` on a test WAV to get reference
+   per-frame features (`frame_features.csv`), ONNX logits (`window_predictions.csv`)
+   and the contract output (`contract_output.json`)
+2. Running the mobile DSP and inference on the same audio
+3. Checking mean absolute error < 0.001 across all 124 feature dimensions, then the
+   golden vectors in `results/v2_validation/golden/` with the contract tolerances
 
 ### Frame Rate and Timing
 
 - Audio frame rate: `8000 / 64 = 125 fps`
 - Window duration: `25 / 125 = 200 ms`
 - Windows per second (stride=2): `125 / 2 = 62.5 windows/s`
-- Latency for 2 s segment: DSP <20 ms + inference <120 ms = **<200 ms total**
+- Latency target for 2 s segment (not yet measured): DSP <20 ms + inference <120 ms = **<200 ms total**
 
 ---
 
@@ -327,7 +678,14 @@ Bit handling:
 int32_t raw = dma_buffer[i];   // 32-bit DMA word
 int32_t s24 = raw >> 8;        // right-shift to get int24
 float   f   = (float)s24 / (float)(1 << 23);  // normalise to [-1, 1]
+int16_t pcm = (int16_t)(s24 >> 8);            // 16-bit PCM for the BLE packet (contract full-scale mapping)
 ```
+
+The inference contract imposes requirements on the firmware:
+- **Pre-trigger and post-offset audio.** Each clip needs audio before the onset and after the offset. Otherwise inhalations touch the clip edges and are not scored (`recording_boundary`).
+- **Packet field width.** The BLE `audio_len` field must be able to hold a 5 s clip.
+
+See `ARCHITECTURE.md` §4–§5.
 
 ### Inhalation Detector
 
@@ -355,8 +713,9 @@ format and fragmentation protocol.
 Firebase project setup:
 1. Enable Firestore, Authentication, Cloud Functions, Storage
 2. Deploy Firestore security rules: users can only read/write their own documents
-3. Cloud Functions: `aggregateDailyAdherence`, `detectTechniqueRegression`,
-   `notifyMissedDose`, `generateClinicianReport`
+3. Cloud Functions: `aggregateDailyAdherence`, `notifyMissedDose` (schedule-based),
+   `generateClinicianReport`. `detectTechniqueRegression` was withdrawn: there is no
+   validated technique measure or threshold.
 
 Session documents are written by the mobile app. See [ARCHITECTURE.md](ARCHITECTURE.md)
 Section 10 for the complete Firestore schema and session document format.
@@ -370,6 +729,8 @@ Section 10 for the complete Firestore schema and session document format.
 | Interface | Owner | Consumer | Contract |
 |---|---|---|---|
 | `inhaler_cnn.onnx` | ML | Mobile | Input (N,25,124) float32; Output (N,4) raw logits |
+| V2 inference contract | ML | Mobile | `results/v2_validation/inference_contract_v2.json` (+ output schema, baseline, golden vectors) |
+| Assessment contract (final pipeline output) | ML | Mobile | `results/final_assessment/assessment_contract_v1.json` (+ reference, output schema, golden vectors) |
 | Feature parameters | ML | Mobile | See DSP parity table in ARCHITECTURE.md §6 |
 | BLE binary packet | Hardware | Mobile | See packet struct in ARCHITECTURE.md §5 |
 | Session document | Mobile | Cloud | See JSON schema in ARCHITECTURE.md §10 |
@@ -391,12 +752,23 @@ Raw audio does not cross any system boundary:
 | ML research pipeline (RF, SVM, XGBoost, CNN) | ✅ Complete |
 | ONNX export (inhaler_cnn.onnx, opset 17) | ✅ Complete |
 | Cross-validation results (89.0% mean accuracy) | ✅ Complete |
+| Inhale-event dataset + usability rule (Stage 1) | ✅ Implemented |
+| Feature analysis + V1 feature selection (Stage 2) | ✅ Implemented |
+| V1 robust baseline + per-feature robust z (Stage 3) | ✅ Implemented |
+| Candidate combined scores, no threshold (Stage 4) | ✅ Implemented |
+| Baseline strategy experiment across sessions (Stage 5) | ✅ Implemented |
+| Natural population separation + controlled sensitivity (Stage 6) | ✅ Implemented |
+| Representation robustness / ablation study (Stage 7) | ✅ Implemented (V2 feature set proposed, not adopted) |
+| V2 validation + inference contract (Stage 8) | ✅ Implemented. Pre-registered gate **failed** (G4c only), so the contract is `DRAFT_NOT_FROZEN`: interface specified and verified; V2 representation not frozen |
+| Final event-level reference-range assessment (Stage 9) | ✅ Implemented. Empirical reference-tail probability and `WITHIN` / `OUTSIDE_REFERENCE_RANGE` against the one-sided 95% upper reference limit, with a `STABLE` / `BORDERLINE` label. The pre-registered gate passed (`CATEGORICAL_ASSESSMENT_ADOPTED`), held-out by recording session on the same PRISM corpus (not external validation); calibration holds marginally across sessions, not per session |
+| Personal reference V3, separate channel (Stage 10) | ✅ Implemented; mechanically verified on PROXY/SYNTHETIC data only; **not validated** as personalization; continuous output, no personal cut-off |
+| NORMAL / ANOMALY or technique-quality output | ⛔ Not supported (no ground truth); `OUTSIDE_REFERENCE_RANGE` is not an anomaly label |
 | ESP32 firmware | 🔲 Not started |
 | BLE protocol implementation | 🔲 Not started |
 | React Native mobile app | 🔲 Not started |
 | On-device DSP (native C++) | 🔲 Not started |
 | ONNX Runtime mobile integration | 🔲 Not started |
-| Personalized baseline engine | 🔲 Not started |
+| Personalized baseline engine (app/cloud integration) | 🔲 Not started (research module: Stage 10) |
 | Firebase backend | 🔲 Not started |
 | Doctor dashboard | 🔲 Not started |
 
